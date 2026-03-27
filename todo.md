@@ -42,4 +42,4 @@
 
 
 ## Current Issue
-- [x] Fix Binance 451 geo-restriction on sandbox — switched to Bybit API (no geo-restrictions)
+- [x] Fix Binance 451 geo-restriction on sandbox — switched to Kraken API (free, globally accessible, no rate-limiting)

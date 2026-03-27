@@ -15,8 +15,10 @@ export default function LiveTicker({ ticker, isLoading }: LiveTickerProps) {
   const isPositive = (ticker?.priceChangePct24h ?? 0) >= 0;
   const changeColor = isPositive ? "#00d4ff" : "#ff4757";
 
-  const fmt = (n: number, decimals = 2) =>
-    n.toLocaleString("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  const fmt = (n: number | null | undefined, decimals = 2) => {
+    if (n === null || n === undefined) return "—";
+    return n.toLocaleString("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  };
 
   return (
     <header
@@ -86,8 +88,8 @@ export default function LiveTicker({ ticker, isLoading }: LiveTickerProps) {
           {/* 24h stats — hidden on mobile */}
           <div className="hidden md:flex items-center gap-4 flex-shrink-0">
             {[
-              { label: "24H High", value: ticker ? `$${fmt(ticker.high24h)}` : "—", color: "#00d4ff" },
-              { label: "24H Low", value: ticker ? `$${fmt(ticker.low24h)}` : "—", color: "#ff4757" },
+              { label: "24H High", value: ticker && ticker.high24h ? `$${fmt(ticker.high24h)}` : "—", color: "#00d4ff" },
+              { label: "24H Low", value: ticker && ticker.low24h ? `$${fmt(ticker.low24h)}` : "—", color: "#ff4757" },
               { label: "Volume", value: ticker ? `${(ticker.volume24h / 1000).toFixed(1)}K BTC` : "—", color: "#8899aa" },
             ].map((stat) => (
               <div key={stat.label} className="text-right">

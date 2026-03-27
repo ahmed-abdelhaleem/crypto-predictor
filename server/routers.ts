@@ -4,24 +4,48 @@ import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, router } from "./_core/trpc";
 import { z } from "zod";
 
-// Bybit API base URL (no geo-restrictions, 1-minute candles available)
-const BYBIT_BASE = "https://api.bybit.com/v5/market";
-const COINGECKO_BASE = "https://api.coingecko.com/api/v3";
+// Kraken free public API — globally accessible, no auth, no rate-limiting
+const KRAKEN_BASE = "https://api.kraken.com/0/public";
 
-async function fetchBybit(path: string): Promise<unknown> {
-  const res = await fetch(`${BYBIT_BASE}${path}`, {
-    headers: { "Accept": "application/json" },
-  });
-  if (!res.ok) throw new Error(`Bybit API error: ${res.status}`);
-  return res.json();
+// Simple in-memory cache to avoid unnecessary API calls
+const cache: Record<string, { data: unknown; expiry: number }> = {};
+
+function getCached(key: string): unknown | null {
+  const entry = cache[key];
+  if (!entry) return null;
+  if (Date.now() > entry.expiry) {
+    delete cache[key];
+    return null;
+  }
+  return entry.data;
 }
 
-async function fetchCoinGecko(path: string): Promise<unknown> {
-  const res = await fetch(`${COINGECKO_BASE}${path}`, {
+function setCached(key: string, data: unknown, ttlSeconds = 10): void {
+  cache[key] = { data, expiry: Date.now() + ttlSeconds * 1000 };
+}
+
+async function fetchKraken(path: string): Promise<unknown> {
+  const cacheKey = `kraken:${path}`;
+  const cached = getCached(cacheKey);
+  if (cached) {
+    console.log(`[Cache HIT] ${cacheKey}`);
+    return cached;
+  }
+
+  const res = await fetch(`${KRAKEN_BASE}${path}`, {
     headers: { "Accept": "application/json" },
   });
-  if (!res.ok) throw new Error(`CoinGecko API error: ${res.status}`);
-  return res.json();
+  if (!res.ok) {
+    throw new Error(`Kraken API error: ${res.status}`);
+  }
+  const json = await res.json();
+  
+  if (json.error && json.error.length > 0) {
+    throw new Error(`Kraken API error: ${json.error[0]}`);
+  }
+
+  setCached(cacheKey, json.result, 10); // Cache for 10 seconds
+  return json.result;
 }
 
 export const appRouter = router({
@@ -35,79 +59,104 @@ export const appRouter = router({
     }),
   }),
 
-  // Bitcoin data proxy — routes Bybit API calls through the server (no geo-restrictions)
+  // Bitcoin data proxy — routes Kraken API calls through the server with caching
   btc: router({
     /**
-     * Get 1-minute OHLCV candles for BTC/USDT from Bybit
+     * Get 1-minute OHLCV candles for BTC/USD from Kraken
      * Used for chart display and prediction algorithm
      */
     klines: publicProcedure
       .input(z.object({ limit: z.number().min(1).max(500).default(30) }))
       .query(async ({ input }) => {
-        const data = await fetchBybit(
-          `/kline?category=spot&symbol=BTCUSDT&interval=1&limit=${input.limit}`
-        ) as { result: { list: [string, string, string, string, string, string, string][] } };
-        
-        // Transform Bybit format to match Binance format for compatibility
-        return data.result.list.map((candle) => [
-          parseInt(candle[0]),
+        try {
+          // Kraken returns: [time, open, high, low, close, vwap, volume, count]
+          const result = await fetchKraken("/OHLC?pair=XBTUSD&interval=1") as Record<string, unknown[]>;
+          const data = result.XXBTZUSD as [number, string, string, string, string, string, string, number][];
+          
+          if (!data || data.length === 0) {
+            throw new Error("No OHLC data returned from Kraken");
+          }
+
+          // Take the most recent candles
+          const recent = data.slice(-input.limit).map((candle) => [
+            candle[0] * 1000, // Convert seconds to milliseconds
+            candle[1], // open
+            candle[2], // high
+            candle[3], // low
+            candle[4], // close
+            candle[6], // volume
+            "0",
+          ]) as [number, string, string, string, string, string, string][];
+
+          return recent;
+        } catch (error) {
+          console.error("[Kraken klines error]", error);
+          throw error;
+        }
+      }),
+
+    /**
+     * Get 24-hour ticker statistics for BTC/USD
+     * Used for the live price header
+     */
+    ticker: publicProcedure.query(async () => {
+      try {
+        const result = await fetchKraken("/Ticker?pair=XBTUSD") as Record<string, Record<string, unknown[]>>;
+        const ticker = result.XXBTZUSD as Record<string, unknown[]>;
+
+        // Kraken format: a=[ask, askwhole, asklot], b=[bid, bidwhole, bidlot], c=[last, volume], v=[today, 24h], p=[today, 24h], t=[today, 24h], l=[today, 24h], h=[today, 24h], o=[today, 24h]
+        const lastPrice = parseFloat((ticker.c as string[])[0]);
+        const high24h = parseFloat((ticker.h as string[])[1]);
+        const low24h = parseFloat((ticker.l as string[])[1]);
+        const volume24h = parseFloat((ticker.v as string[])[1]);
+        const open24h = parseFloat((ticker.o as string[])[1]);
+        const change24h = lastPrice - open24h;
+        const changePct24h = open24h > 0 ? (change24h / open24h) * 100 : 0;
+
+        return {
+          price: lastPrice,
+          priceChange24h: change24h,
+          priceChangePct24h: changePct24h,
+          high24h,
+          low24h,
+          volume24h,
+          lastUpdate: Date.now(),
+        };
+      } catch (error) {
+        console.error("[Kraken ticker error]", error);
+        throw error;
+      }
+    }),
+
+    /**
+     * Get recent candles for polling
+     * Used for live updates every 10 seconds
+     */
+    recent: publicProcedure.query(async () => {
+      try {
+        const result = await fetchKraken("/OHLC?pair=XBTUSD&interval=1") as Record<string, unknown[]>;
+        const data = result.XXBTZUSD as [number, string, string, string, string, string, string, number][];
+
+        if (!data || data.length === 0) {
+          throw new Error("No recent candles returned from Kraken");
+        }
+
+        // Return last 6 candles
+        const recent = data.slice(-6).map((candle) => [
+          candle[0] * 1000,
           candle[1],
           candle[2],
           candle[3],
           candle[4],
-          candle[5],
-          "0", // placeholder for close time
+          candle[6],
+          "0",
         ]) as [number, string, string, string, string, string, string][];
-      }),
 
-    /**
-     * Get 24-hour ticker statistics for BTC/USDT
-     * Used for the live price header
-     */
-    ticker: publicProcedure.query(async () => {
-      const data = await fetchCoinGecko(
-        "/simple/price?ids=bitcoin&vs_currencies=usd&include_market_cap=true&include_24hr_vol=true&include_24hr_change=true"
-      ) as { bitcoin: { usd: number; usd_24h_change: number; usd_market_cap: number; usd_24h_vol: number } };
-      
-      const btc = data.bitcoin;
-      // Fetch additional high/low data from Bybit ticker
-      const tickerData = await fetchBybit(
-        "/tickers?category=spot&symbol=BTCUSDT"
-      ) as { result: { list: [{ lastPrice: string; highPrice24h: string; lowPrice24h: string }] } };
-      
-      const ticker = tickerData.result.list[0];
-      const price = parseFloat(ticker.lastPrice);
-      const change24h = (btc.usd_24h_change / 100) * price;
-      
-      return {
-        price,
-        priceChange24h: change24h,
-        priceChangePct24h: btc.usd_24h_change,
-        high24h: parseFloat(ticker.highPrice24h),
-        low24h: parseFloat(ticker.lowPrice24h),
-        volume24h: btc.usd_24h_vol,
-        lastUpdate: Date.now(),
-      };
-    }),
-
-    /**
-     * Get recent candles for polling (last 6 candles)
-     * Used for live updates every 10 seconds
-     */
-    recent: publicProcedure.query(async () => {
-      const data = await fetchBybit(
-        "/kline?category=spot&symbol=BTCUSDT&interval=1&limit=6"
-      ) as { result: { list: [string, string, string, string, string, string, string][] } };
-      
-      return data.result.list.map((candle) => [
-        parseInt(candle[0]),
-        candle[1],
-        candle[2],
-        candle[3],
-        candle[4],
-        candle[5],
-        "0",
-      ]) as [number, string, string, string, string, string, string][];
+        return recent;
+      } catch (error) {
+        console.error("[Kraken recent error]", error);
+        throw error;
+      }
     }),
   }),
 });
