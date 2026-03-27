@@ -39,3 +39,7 @@
 - [x] Fixed geo-restriction issue (Binance 451 error) via server-side proxy
 - [x] Fixed TypeScript errors from upgrade merge conflicts
 - [x] Fixed stale Vite cache after server upgrade
+
+
+## Current Issue
+- [x] Fix Binance 451 geo-restriction on sandbox — switched to Bybit API (no geo-restrictions)
