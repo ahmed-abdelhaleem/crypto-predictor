@@ -1,5 +1,6 @@
 [build]
 builder = "NIXPACKS"
+buildCommand = "npm install -g pnpm@10.4.1 && pnpm install --no-frozen-lockfile && pnpm run build"
 
 [deploy]
 startCommand = "node dist/index.js"
