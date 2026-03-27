@@ -1,16 +1,21 @@
 /**
  * Home — Main page for CryptoOracle BTC Predictor
  * Design: Glassmorphic Night Sky
- * Layout: Full-height app shell, sticky header, responsive grid (chart + prediction panel)
- * Mobile: Single column, chart first, prediction panel below
+ * Layout:
+ *   - Left (2/3): Chart + Window History
+ *   - Right (1/3): Prediction Panel + Decision Engine + AI Panel + Session Stats
  */
 
 import CandleChart from "@/components/CandleChart";
 import LiveTicker from "@/components/LiveTicker";
 import PredictionPanel from "@/components/PredictionPanel";
 import WindowHistory from "@/components/WindowHistory";
+import AIPredictionPanel from "@/components/AIPredictionPanel";
+import RecommendationEngine from "@/components/RecommendationEngine";
+import SessionStatsPanel from "@/components/SessionStatsPanel";
 import { useBitcoinData } from "@/hooks/useBitcoinData";
 import { AlertCircle, RefreshCw } from "lucide-react";
+import { useState } from "react";
 
 const BG_URL = "https://d2xsxph8kpxj0f.cloudfront.net/310519663482996437/g7kKL6GCFpLYNEHMGxFTYy/crypto-bg-fPiZmNZE5QfZGj8Bnsoa8f.webp";
 
@@ -26,7 +31,13 @@ export default function Home() {
     analysisProgress,
     isInAnalysisPhase,
     accuracy,
+    sessionStats,
   } = useBitcoinData();
+
+  // Track AI prediction state to feed into the decision engine
+  const [aiPrediction, setAiPrediction] = useState<"UP" | "DOWN" | "SKIP" | null>(null);
+  const [aiConfidence, setAiConfidence] = useState<number | undefined>(undefined);
+  const [aiRiskLevel, setAiRiskLevel] = useState<"LOW" | "MEDIUM" | "HIGH" | null>(null);
 
   return (
     <div
@@ -122,7 +133,7 @@ export default function Home() {
           {/* Main dashboard grid */}
           {!isLoading && (
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-              {/* Chart — takes 2/3 on desktop */}
+              {/* Left column — Chart + Window History */}
               <div className="lg:col-span-2 flex flex-col gap-4">
                 {/* Chart card */}
                 <div className="glass-panel p-4" style={{ minHeight: "320px" }}>
@@ -161,9 +172,10 @@ export default function Home() {
                     <span className="text-xs font-semibold tracking-widest uppercase" style={{ color: "#8899aa" }}>
                       Past Windows
                     </span>
-                    <div className="flex items-center gap-4 text-xs font-mono-data" style={{ color: "#445566" }}>
+                    <div className="hidden sm:flex items-center gap-4 text-xs font-mono-data" style={{ color: "#445566" }}>
                       <span>Prediction</span>
                       <span>Actual</span>
+                      <span>Δ Price</span>
                       <span>Conf</span>
                       <span>✓</span>
                     </div>
@@ -172,8 +184,9 @@ export default function Home() {
                 </div>
               </div>
 
-              {/* Prediction panel — 1/3 on desktop, full width on mobile */}
-              <div className="lg:col-span-1">
+              {/* Right column — Prediction + Decision + AI + Stats */}
+              <div className="lg:col-span-1 flex flex-col gap-3">
+                {/* Math prediction panel */}
                 <PredictionPanel
                   currentWindow={currentWindow}
                   windowProgress={windowProgress}
@@ -181,30 +194,60 @@ export default function Home() {
                   isInAnalysisPhase={isInAnalysisPhase}
                   accuracy={accuracy}
                 />
+
+                {/* Decision Engine — UP/DOWN/SKIP recommendation */}
+                <RecommendationEngine
+                  currentWindow={currentWindow}
+                  sessionStats={sessionStats}
+                  aiPrediction={aiPrediction}
+                  aiConfidence={aiConfidence}
+                  aiRiskLevel={aiRiskLevel}
+                />
+
+                {/* AI Prediction Panel */}
+                <AIPredictionPanel
+                  currentWindow={currentWindow}
+                  isInAnalysisPhase={isInAnalysisPhase}
+                  sessionAccuracy={accuracy}
+                  onResult={(pred, conf, risk) => {
+                    setAiPrediction(pred);
+                    setAiConfidence(conf);
+                    setAiRiskLevel(risk);
+                  }}
+                />
+
+                {/* Session Stats */}
+                <SessionStatsPanel stats={sessionStats} />
               </div>
             </div>
           )}
 
           {/* How it works — info strip */}
           <div className="mt-4 glass-panel p-4">
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-center">
+            <div className="grid grid-cols-1 sm:grid-cols-4 gap-4 text-center">
               {[
                 {
                   step: "01",
                   title: "3-Min Analysis",
-                  desc: "First 3 minutes of each 5-min window are analyzed for momentum, volume, and velocity signals",
+                  desc: "First 3 minutes analyzed using 10 technical indicators: EMA, RSI, Bollinger Bands, VWAP, momentum, volume delta, velocity, body ratio, wick bias, trend strength",
                   color: "#00d4ff",
                 },
                 {
                   step: "02",
-                  title: "Trend Prediction",
-                  desc: "Algorithm predicts UP or DOWN for the remaining 2 minutes based on weighted signal composite",
+                  title: "Math Model",
+                  desc: "Weighted composite score across all indicators produces UP/DOWN/NEUTRAL prediction with calibrated confidence and signal strength",
                   color: "#ffd700",
                 },
                 {
                   step: "03",
-                  title: "Result Tracking",
-                  desc: "Each prediction is verified at window close and accuracy is tracked across all sessions",
+                  title: "AI Analysis",
+                  desc: "Gemini 2.5 Flash independently analyzes all signals and provides a second opinion with risk assessment and reasoning",
+                  color: "#a78bfa",
+                },
+                {
+                  step: "04",
+                  title: "Decision Engine",
+                  desc: "Combines both models into a final BET UP / BET DOWN / SKIP recommendation with risk score and supporting evidence",
                   color: "#ff4757",
                 },
               ].map((item) => (
@@ -225,7 +268,7 @@ export default function Home() {
           {/* Footer */}
           <div className="mt-4 pb-4 text-center">
             <p className="text-xs font-mono-data" style={{ color: "#334455" }}>
-              Data from Binance · For educational purposes only · Not financial advice
+              Data from Kraken · For educational purposes only · Not financial advice · Past performance does not guarantee future results
             </p>
           </div>
         </main>
@@ -233,3 +276,5 @@ export default function Home() {
     </div>
   );
 }
+
+

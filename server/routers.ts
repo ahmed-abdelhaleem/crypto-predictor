@@ -2,6 +2,7 @@ import { COOKIE_NAME } from "@shared/const";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, router } from "./_core/trpc";
+import { invokeLLM } from "./_core/llm";
 import { z } from "zod";
 
 // Kraken free public API — globally accessible, no auth, no rate-limiting
@@ -47,6 +48,32 @@ async function fetchKraken(path: string): Promise<unknown> {
   setCached(cacheKey, json.result, 10); // Cache for 10 seconds
   return json.result;
 }
+
+// ---- AI Prediction Input Schema ----
+const CandleSchema = z.object({
+  time: z.number(),
+  open: z.number(),
+  high: z.number(),
+  low: z.number(),
+  close: z.number(),
+  volume: z.number(),
+  isBullish: z.boolean(),
+});
+
+const FactorsSchema = z.object({
+  momentum: z.number(),
+  volumeDelta: z.number(),
+  priceVelocity: z.number(),
+  rsiScore: z.number(),
+  emaSignal: z.number(),
+  bollingerPos: z.number(),
+  vwapDeviation: z.number(),
+  bodyRatio: z.number(),
+  wickBias: z.number(),
+  trendStrength: z.number(),
+  rawScore: z.number(),
+  signalStrength: z.enum(["STRONG", "MODERATE", "WEAK"]),
+});
 
 export const appRouter = router({
   system: systemRouter,
@@ -104,7 +131,6 @@ export const appRouter = router({
         const result = await fetchKraken("/Ticker?pair=XBTUSD") as Record<string, Record<string, unknown[]>>;
         const ticker = result.XXBTZUSD as Record<string, unknown[]>;
 
-        // Kraken format: a=[ask, askwhole, asklot], b=[bid, bidwhole, bidlot], c=[last, volume], v=[today, 24h], p=[today, 24h], t=[today, 24h], l=[today, 24h], h=[today, 24h], o=[today, 24h]
         const lastPrice = parseFloat((ticker.c as string[])[0]);
         const high24h = parseFloat((ticker.h as string[])[1]);
         const low24h = parseFloat((ticker.l as string[])[1]);
@@ -158,7 +184,127 @@ export const appRouter = router({
         throw error;
       }
     }),
+
+    /**
+     * AI-powered prediction using Gemini 2.5 Flash
+     * Analyzes candle data + technical factors and returns structured prediction
+     * Cached for 60 seconds to avoid excessive LLM calls
+     */
+    aiPredict: publicProcedure
+      .input(z.object({
+        candles: z.array(CandleSchema),
+        factors: FactorsSchema,
+        mathPrediction: z.enum(["UP", "DOWN", "NEUTRAL"]),
+        mathConfidence: z.number(),
+        sessionAccuracy: z.number(),
+        windowStart: z.number(),
+      }))
+      .mutation(async ({ input }) => {
+        // Cache key based on window start to avoid repeated calls for same window
+        const cacheKey = `ai_predict:${input.windowStart}`;
+        const cached = getCached(cacheKey);
+        if (cached) {
+          console.log(`[Cache HIT] ${cacheKey}`);
+          return cached as AIPredictionResult;
+        }
+
+        try {
+          const { candles, factors, mathPrediction, mathConfidence, sessionAccuracy } = input;
+
+          // Build a concise market summary for the AI
+          const candleSummary = candles.map((c, i) => {
+            const dir = c.isBullish ? "▲" : "▼";
+            const body = Math.abs(c.close - c.open);
+            const range = c.high - c.low;
+            const bodyPct = range > 0 ? ((body / range) * 100).toFixed(0) : "0";
+            return `  Candle ${i + 1}: ${dir} O:${c.open.toFixed(2)} H:${c.high.toFixed(2)} L:${c.low.toFixed(2)} C:${c.close.toFixed(2)} Vol:${c.volume.toFixed(4)} Body:${bodyPct}%`;
+          }).join("\n");
+
+          const prompt = `You are an expert quantitative crypto trader analyzing BTC/USDT for a 5-minute binary prediction (will price be HIGHER or LOWER at window close vs window open?).
+
+## Market Data (last 3 minutes of current 5-min window)
+${candleSummary}
+
+## Technical Indicators
+- Momentum: ${factors.momentum} (price change strength, -100 to +100)
+- Volume Delta: ${factors.volumeDelta} (bull vs bear volume, -100 to +100)
+- Price Velocity: ${factors.priceVelocity} (acceleration, -100 to +100)
+- RSI(3): ${factors.rsiScore}/100
+- EMA Signal: ${factors.emaSignal} (EMA3 vs EMA5 crossover)
+- Bollinger Position: ${factors.bollingerPos}/100 (0=lower band, 100=upper band)
+- VWAP Deviation: ${factors.vwapDeviation} (% from VWAP)
+- Candle Body Ratio: ${factors.bodyRatio}/100 (conviction strength)
+- Wick Bias: ${factors.wickBias} (+= bullish rejection, -= bearish rejection)
+- Trend Strength: ${factors.trendStrength}/100
+- Composite Score: ${factors.rawScore} (${factors.signalStrength} signal)
+
+## Mathematical Model Output
+- Prediction: ${mathPrediction}
+- Confidence: ${mathConfidence.toFixed(1)}%
+- Session Accuracy: ${sessionAccuracy}%
+
+## Your Task
+Analyze all signals and provide:
+1. Your independent prediction (UP, DOWN, or SKIP if too risky/unclear)
+2. Confidence level (0-100%)
+3. Risk level (LOW, MEDIUM, HIGH)
+4. A brief reasoning (2-3 sentences max)
+5. Key supporting signals (up to 3 bullet points)
+6. Key risk factors (up to 2 bullet points)
+
+Respond in JSON only. Be decisive but honest about uncertainty. SKIP means the risk/reward is unfavorable.`;
+
+          const result = await invokeLLM({
+            messages: [{ role: "user", content: prompt }],
+            outputSchema: {
+              name: "ai_prediction",
+              schema: {
+                type: "object",
+                properties: {
+                  prediction: { type: "string", enum: ["UP", "DOWN", "SKIP"] },
+                  confidence: { type: "number", minimum: 0, maximum: 100 },
+                  riskLevel: { type: "string", enum: ["LOW", "MEDIUM", "HIGH"] },
+                  reasoning: { type: "string" },
+                  supportingSignals: { type: "array", items: { type: "string" }, maxItems: 3 },
+                  riskFactors: { type: "array", items: { type: "string" }, maxItems: 2 },
+                },
+                required: ["prediction", "confidence", "riskLevel", "reasoning", "supportingSignals", "riskFactors"],
+                additionalProperties: false,
+              },
+              strict: true,
+            },
+          });
+
+          const content = result.choices[0]?.message?.content;
+          const text = typeof content === "string" ? content : JSON.stringify(content);
+          const parsed = JSON.parse(text) as AIPredictionResult;
+
+          setCached(cacheKey, parsed, 60); // Cache for 60 seconds (one window)
+          return parsed;
+        } catch (error) {
+          console.error("[AI Predict error]", error);
+          // Return a fallback response instead of throwing
+          const fallback: AIPredictionResult = {
+            prediction: "SKIP",
+            confidence: 0,
+            riskLevel: "HIGH",
+            reasoning: "AI analysis temporarily unavailable. Rely on mathematical model only.",
+            supportingSignals: [],
+            riskFactors: ["AI service unavailable"],
+          };
+          return fallback;
+        }
+      }),
   }),
 });
+
+export type AIPredictionResult = {
+  prediction: "UP" | "DOWN" | "SKIP";
+  confidence: number;
+  riskLevel: "LOW" | "MEDIUM" | "HIGH";
+  reasoning: string;
+  supportingSignals: string[];
+  riskFactors: string[];
+};
 
 export type AppRouter = typeof appRouter;
