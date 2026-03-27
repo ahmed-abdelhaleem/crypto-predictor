@@ -2,8 +2,36 @@ import { COOKIE_NAME } from "@shared/const";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, router } from "./_core/trpc";
-import { invokeLLM } from "./_core/llm";
 import { z } from "zod";
+
+// ---- Lightweight OpenAI-compatible LLM call (works on Railway with OPENAI_API_KEY) ----
+async function callLLM(prompt: string): Promise<string> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  const baseUrl = (process.env.OPENAI_BASE_URL || process.env.BUILT_IN_FORGE_API_URL || "https://api.openai.com/v1").replace(/\/$/, "");
+  const model = process.env.LLM_MODEL || "gpt-4.1-mini";
+
+  if (!apiKey) throw new Error("OPENAI_API_KEY is not set");
+
+  const res = await fetch(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1024,
+      temperature: 0.2,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`LLM API error: ${res.status} ${err}`);
+  }
+
+  const json = await res.json() as { choices: { message: { content: string } }[] };
+  return json.choices[0]?.message?.content ?? "{}";
+}
 
 // Kraken free public API — globally accessible, no auth, no rate-limiting
 const KRAKEN_BASE = "https://api.kraken.com/0/public";
@@ -254,29 +282,7 @@ Analyze all signals and provide:
 
 Respond in JSON only. Be decisive but honest about uncertainty. SKIP means the risk/reward is unfavorable.`;
 
-          const result = await invokeLLM({
-            messages: [{ role: "user", content: prompt }],
-            outputSchema: {
-              name: "ai_prediction",
-              schema: {
-                type: "object",
-                properties: {
-                  prediction: { type: "string", enum: ["UP", "DOWN", "SKIP"] },
-                  confidence: { type: "number", minimum: 0, maximum: 100 },
-                  riskLevel: { type: "string", enum: ["LOW", "MEDIUM", "HIGH"] },
-                  reasoning: { type: "string" },
-                  supportingSignals: { type: "array", items: { type: "string" }, maxItems: 3 },
-                  riskFactors: { type: "array", items: { type: "string" }, maxItems: 2 },
-                },
-                required: ["prediction", "confidence", "riskLevel", "reasoning", "supportingSignals", "riskFactors"],
-                additionalProperties: false,
-              },
-              strict: true,
-            },
-          });
-
-          const content = result.choices[0]?.message?.content;
-          const text = typeof content === "string" ? content : JSON.stringify(content);
+          const text = await callLLM(prompt);
           const parsed = JSON.parse(text) as AIPredictionResult;
 
           setCached(cacheKey, parsed, 60); // Cache for 60 seconds (one window)
