@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: crypto-predictor
+    runtime: node
+    region: oregon
+    plan: free
+    buildCommand: npm install -g pnpm && pnpm install --no-frozen-lockfile && pnpm run build
+    startCommand: node dist/index.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: JWT_SECRET
+        value: crypto-oracle-secret-2026
+      - key: OAUTH_SERVER_URL
+        value: https://placeholder.invalid
+      - key: VITE_APP_ID
+        value: crypto-predictor
+      - key: OWNER_OPEN_ID
+        value: placeholder
+      - key: LLM_MODEL
+        value: gpt-4.1-mini
+      - key: OPENAI_BASE_URL
+        value: https://api.openai.com/v1
+      - key: OPENAI_API_KEY
+        sync: false
