@@ -8,6 +8,13 @@
       "when": 1774600919857,
       "tag": "0000_lively_deathstrike",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1774700000000,
+      "tag": "0001_crypto_predictor_tables",
+      "breakpoints": true
     }
   ]
 }

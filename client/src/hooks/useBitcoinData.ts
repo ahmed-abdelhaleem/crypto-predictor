@@ -1,12 +1,12 @@
 /**
  * useBitcoinData — Core hook for real-time BTC price data and 5-minute window prediction
  *
- * Strategy:
- * - Fetches 1-minute OHLCV candles via tRPC backend proxy (avoids geo-restrictions)
- * - Groups candles into 5-minute windows
- * - Analyzes the first 3 minutes of each window to predict UP/DOWN by end of window
- * - Prediction algorithm uses: EMA crossover, Bollinger Bands, VWAP deviation,
- *   momentum, RSI, volume delta, price velocity, candle body/wick analysis
+ * Enhanced features:
+ * - Persists prediction windows to DB via tRPC
+ * - Loads full history from DB on mount
+ * - Uses ML-adjusted weights from server
+ * - Supports mid-window prediction revisions
+ * - Pattern enable/disable support
  */
 
 import { trpc } from "@/lib/trpc";
@@ -23,20 +23,17 @@ export interface Candle {
 }
 
 export interface AdvancedFactors {
-  // Original factors
   momentum: number;
   volumeDelta: number;
   priceVelocity: number;
   rsiScore: number;
-  // New advanced factors
-  emaSignal: number;       // EMA3 vs EMA5 crossover signal (-100 to 100)
-  bollingerPos: number;    // Position within Bollinger Bands (0-100, 50=mid)
-  vwapDeviation: number;   // % deviation from VWAP (-100 to 100)
-  bodyRatio: number;       // Candle body/range ratio (0-100, higher = stronger)
-  wickBias: number;        // Upper vs lower wick bias (-100 to 100)
-  trendStrength: number;   // Consecutive same-direction candles (0-100)
-  // Composite
-  rawScore: number;        // Weighted composite before normalization
+  emaSignal: number;
+  bollingerPos: number;
+  vwapDeviation: number;
+  bodyRatio: number;
+  wickBias: number;
+  trendStrength: number;
+  rawScore: number;
   signalStrength: "STRONG" | "MODERATE" | "WEAK";
 }
 
@@ -50,15 +47,15 @@ export interface FiveMinWindow {
   actualResult: "UP" | "DOWN" | null;
   predictionCorrect: boolean | null;
   analysisFactors: AdvancedFactors;
-  // Price stats
   openPrice: number;
   closePrice: number | null;
   priceChangePct: number | null;
   highPrice: number;
   lowPrice: number;
   totalVolume: number;
-  // Streak info
   streakType: "WIN" | "LOSS" | "NONE";
+  dbId?: number;
+  source?: string;
 }
 
 export interface LiveTicker {
@@ -97,6 +94,7 @@ export interface UseBitcoinDataResult {
   isInAnalysisPhase: boolean;
   accuracy: number;
   sessionStats: SessionStats;
+  dbHistoryTotal: number;
 }
 
 // ---- Advanced Technical Indicators ----
@@ -151,12 +149,21 @@ function computeRSI(candles: Candle[], period = 3): number {
   return 100 - 100 / (1 + rs);
 }
 
-// ---- Advanced Prediction Algorithm ----
-export function computePrediction(candles: Candle[]): {
+// ---- Advanced Prediction Algorithm with configurable weights ----
+export function computePrediction(
+  candles: Candle[],
+  weights?: Record<string, number>
+): {
   prediction: "UP" | "DOWN" | "NEUTRAL";
   confidence: number;
   factors: AdvancedFactors;
 } {
+  const w = weights ?? {
+    momentum: 0.25, volumeDelta: 0.20, priceVelocity: 0.15,
+    rsiScore: 0.10, emaSignal: 0.10, bollingerPos: 0.08,
+    vwapDeviation: 0.05, wickBias: 0.04, trendStrength: 0.03,
+  };
+
   const emptyFactors: AdvancedFactors = {
     momentum: 0, volumeDelta: 0, priceVelocity: 0, rsiScore: 50,
     emaSignal: 0, bollingerPos: 50, vwapDeviation: 0,
@@ -172,12 +179,12 @@ export function computePrediction(candles: Candle[]): {
   const last = candles[candles.length - 1];
   const closes = candles.map((c) => c.close);
 
-  // 1. Momentum: net price change over analysis window
+  // 1. Momentum
   const priceChange = last.close - first.open;
   const priceChangePct = (priceChange / first.open) * 100;
   const momentum = Math.max(-100, Math.min(100, priceChangePct * 200));
 
-  // 2. Volume delta: buy vs sell pressure
+  // 2. Volume delta
   let bullishVol = 0;
   let bearishVol = 0;
   candles.forEach((c) => {
@@ -187,7 +194,7 @@ export function computePrediction(candles: Candle[]): {
   const totalVol = bullishVol + bearishVol;
   const volumeDelta = totalVol > 0 ? ((bullishVol - bearishVol) / totalVol) * 100 : 0;
 
-  // 3. Price velocity: acceleration (second derivative)
+  // 3. Price velocity (acceleration)
   let velocity = 0;
   if (candles.length >= 3) {
     const mid = Math.floor(candles.length / 2);
@@ -196,10 +203,10 @@ export function computePrediction(candles: Candle[]): {
     velocity = Math.max(-100, Math.min(100, (secondHalfChange - firstHalfChange) / first.open * 5000));
   }
 
-  // 4. RSI (proper calculation)
+  // 4. RSI
   const rsiScore = computeRSI(candles, Math.min(3, candles.length - 1));
 
-  // 5. EMA crossover signal
+  // 5. EMA crossover
   const ema3 = computeEMA(closes, Math.min(3, closes.length));
   const ema5 = computeEMA(closes, Math.min(5, closes.length));
   const emaLast3 = ema3[ema3.length - 1] ?? last.close;
@@ -208,9 +215,9 @@ export function computePrediction(candles: Candle[]): {
     ? Math.max(-100, Math.min(100, ((emaLast3 - emaLast5) / emaLast5) * 10000))
     : 0;
 
-  // 6. Bollinger Band position
+  // 6. Bollinger position
   const bb = computeBollingerBands(closes, Math.min(closes.length, 5));
-  const bollingerPos = bb.position; // 0=at lower band, 100=at upper band
+  const bollingerPos = bb.position;
 
   // 7. VWAP deviation
   const vwap = computeVWAP(candles);
@@ -218,7 +225,7 @@ export function computePrediction(candles: Candle[]): {
     ? Math.max(-100, Math.min(100, ((last.close - vwap) / vwap) * 10000))
     : 0;
 
-  // 8. Candle body/wick analysis
+  // 8. Body/wick analysis
   let totalBodyRatio = 0;
   let totalWickBias = 0;
   candles.forEach((c) => {
@@ -230,7 +237,6 @@ export function computePrediction(candles: Candle[]): {
       const lowerWick = Math.min(c.open, c.close) - c.low;
       const wickRange = upperWick + lowerWick;
       if (wickRange > 0) {
-        // Positive = more lower wick (bullish rejection), negative = more upper wick (bearish rejection)
         totalWickBias += ((lowerWick - upperWick) / wickRange) * 100;
       }
     }
@@ -238,7 +244,7 @@ export function computePrediction(candles: Candle[]): {
   const bodyRatio = totalBodyRatio / candles.length;
   const wickBias = totalWickBias / candles.length;
 
-  // 9. Trend strength: consecutive same-direction candles
+  // 9. Trend strength
   let streak = 0;
   const lastDir = candles[candles.length - 1].isBullish;
   for (let i = candles.length - 1; i >= 0; i--) {
@@ -248,23 +254,19 @@ export function computePrediction(candles: Candle[]): {
   const trendStrength = Math.min(100, (streak / candles.length) * 100 + (lastDir ? 20 : -20) + 50);
 
   // ---- Weighted Composite Score ----
-  // Weights tuned for 5-min BTC binary prediction
   const score =
-    momentum       * 0.25 +
-    volumeDelta    * 0.20 +
-    velocity       * 0.15 +
-    (rsiScore - 50) * 2 * 0.10 +
-    emaSignal      * 0.10 +
-    (bollingerPos - 50) * 2 * 0.08 +
-    vwapDeviation  * 0.05 +
-    wickBias       * 0.04 +
-    (trendStrength - 50) * 2 * 0.03;
+    momentum                 * (w.momentum     ?? 0.25) +
+    volumeDelta              * (w.volumeDelta   ?? 0.20) +
+    velocity                 * (w.priceVelocity ?? 0.15) +
+    (rsiScore - 50) * 2      * (w.rsiScore      ?? 0.10) +
+    emaSignal                * (w.emaSignal     ?? 0.10) +
+    (bollingerPos - 50) * 2  * (w.bollingerPos  ?? 0.08) +
+    vwapDeviation            * (w.vwapDeviation ?? 0.05) +
+    wickBias                 * (w.wickBias      ?? 0.04) +
+    (trendStrength - 50) * 2 * (w.trendStrength ?? 0.03);
 
   const absScore = Math.abs(score);
-
-  // Confidence: calibrated to historical accuracy range
-  // Base 50%, scale by signal strength, cap at 95%
-  const bodyBonus = (bodyRatio - 50) * 0.1; // Strong candle bodies add confidence
+  const bodyBonus = (bodyRatio - 50) * 0.1;
   const confidence = Math.min(95, Math.max(5, 50 + absScore * 0.75 + bodyBonus));
 
   let prediction: "UP" | "DOWN" | "NEUTRAL";
@@ -305,99 +307,113 @@ function parseRawCandle(raw: [number, string, string, string, string, string, ..
   const l = parseFloat(raw[3]);
   const c = parseFloat(raw[4]);
   const v = parseFloat(raw[5]);
-  return { time: raw[0], open: o, high: h, low: l, close: c, volume: v, isBullish: c >= o };
+  return {
+    time: raw[0],
+    open: o,
+    high: h,
+    low: l,
+    close: c,
+    volume: v,
+    isBullish: c >= o,
+  };
 }
 
 function buildWindowFromCandles(
-  ws: number,
-  sortedCandles: Candle[],
-  isCompleted: boolean
+  windowStart: number,
+  candles: Candle[],
+  isFinalized: boolean,
+  weights?: Record<string, number>
 ): FiveMinWindow {
-  const openPrice = sortedCandles[0]?.open ?? 0;
-  const closePrice = isCompleted ? sortedCandles[sortedCandles.length - 1]?.close ?? null : null;
-  const highPrice = sortedCandles.reduce((m, c) => Math.max(m, c.high), 0);
-  const lowPrice = sortedCandles.reduce((m, c) => Math.min(m, c.low), Infinity);
-  const totalVolume = sortedCandles.reduce((s, c) => s + c.volume, 0);
-  const priceChangePct = isCompleted && openPrice > 0 && closePrice !== null
-    ? ((closePrice - openPrice) / openPrice) * 100
-    : null;
+  const windowEnd = windowStart + 5 * 60 * 1000;
+  const openPrice = candles[0]?.open ?? 0;
+  const closePrice = isFinalized ? (candles[candles.length - 1]?.close ?? null) : null;
+  const highPrice = candles.reduce((m, c) => Math.max(m, c.high), openPrice);
+  const lowPrice = candles.reduce((m, c) => Math.min(m, c.low), openPrice);
+  const totalVolume = candles.reduce((s, c) => s + c.volume, 0);
 
-  const analysisCandles = sortedCandles.slice(0, 3);
-  const { prediction, confidence, factors } = computePrediction(analysisCandles);
-  const actualResult: "UP" | "DOWN" | null = isCompleted && closePrice !== null
-    ? (closePrice >= openPrice ? "UP" : "DOWN")
-    : null;
-  const predictionCorrect = isCompleted && prediction !== "NEUTRAL" && actualResult !== null
-    ? prediction === actualResult
-    : null;
+  const analysisCandles = candles.slice(0, 3);
+  const { prediction, confidence, factors } =
+    analysisCandles.length >= 2
+      ? computePrediction(analysisCandles, weights)
+      : { prediction: "NEUTRAL" as const, confidence: 0, factors: {
+          momentum: 0, volumeDelta: 0, priceVelocity: 0, rsiScore: 50,
+          emaSignal: 0, bollingerPos: 50, vwapDeviation: 0,
+          bodyRatio: 50, wickBias: 0, trendStrength: 50,
+          rawScore: 0, signalStrength: "WEAK" as const,
+        }};
+
+  let actualResult: "UP" | "DOWN" | null = null;
+  let predictionCorrect: boolean | null = null;
+  let priceChangePct: number | null = null;
+
+  if (isFinalized && closePrice !== null) {
+    priceChangePct = openPrice > 0 ? ((closePrice - openPrice) / openPrice) * 100 : 0;
+    actualResult = closePrice >= openPrice ? "UP" : "DOWN";
+    predictionCorrect = prediction !== "NEUTRAL" ? prediction === actualResult : null;
+  }
 
   return {
-    windowStart: ws,
-    windowEnd: ws + 5 * 60 * 1000,
-    candles: sortedCandles,
+    windowStart,
+    windowEnd,
+    candles,
     prediction,
     predictionConfidence: confidence,
-    predictionMadeAt: ws + 3 * 60 * 1000,
+    predictionMadeAt: windowStart + 3 * 60 * 1000,
     actualResult,
     predictionCorrect,
     analysisFactors: factors,
     openPrice,
     closePrice,
     priceChangePct,
-    highPrice: highPrice === 0 ? openPrice : highPrice,
-    lowPrice: lowPrice === Infinity ? openPrice : lowPrice,
+    highPrice,
+    lowPrice,
     totalVolume,
     streakType: "NONE",
   };
 }
 
-function computeSessionStats(pastWindows: FiveMinWindow[]): SessionStats {
-  const decided = pastWindows.filter((w) => w.predictionCorrect !== null);
+function computeSessionStats(windows: FiveMinWindow[]): SessionStats {
+  const decided = windows.filter((w) => w.predictionCorrect !== null);
   const correct = decided.filter((w) => w.predictionCorrect === true);
-  const accuracy = decided.length > 0 ? Math.round((correct.length / decided.length) * 100) : 0;
+  const totalPredictions = decided.length;
+  const correctPredictions = correct.length;
+  const accuracy = totalPredictions > 0 ? Math.round((correctPredictions / totalPredictions) * 100) : 0;
 
-  // Current streak
   let currentStreak = 0;
   let currentStreakType: "WIN" | "LOSS" | "NONE" = "NONE";
-  for (const w of decided) {
-    if (currentStreakType === "NONE") {
-      currentStreakType = w.predictionCorrect ? "WIN" : "LOSS";
-      currentStreak = 1;
-    } else if ((currentStreakType === "WIN") === w.predictionCorrect) {
-      currentStreak++;
-    } else {
-      break;
-    }
-  }
-
-  // Best streak
   let bestStreak = 0;
   let tempStreak = 0;
-  let tempType: boolean | null = null;
-  for (const w of [...decided].reverse()) {
-    if (tempType === null || tempType === w.predictionCorrect) {
+  let lastType: boolean | null = null;
+
+  for (let i = 0; i < decided.length; i++) {
+    const isWin = decided[i].predictionCorrect === true;
+    if (lastType === null || lastType === isWin) {
       tempStreak++;
-      tempType = w.predictionCorrect;
+      lastType = isWin;
     } else {
-      bestStreak = Math.max(bestStreak, tempStreak);
       tempStreak = 1;
-      tempType = w.predictionCorrect;
+      lastType = isWin;
+    }
+    if (tempStreak > bestStreak) bestStreak = tempStreak;
+    if (i === decided.length - 1) {
+      currentStreak = tempStreak;
+      currentStreakType = isWin ? "WIN" : "LOSS";
     }
   }
-  bestStreak = Math.max(bestStreak, tempStreak);
 
-  const avgConfidence = decided.length > 0
-    ? Math.round(decided.reduce((s, w) => s + w.predictionConfidence, 0) / decided.length)
+  const withConf = windows.filter((w) => w.predictionConfidence > 0);
+  const avgConfidence = withConf.length > 0
+    ? Math.round(withConf.reduce((s, w) => s + w.predictionConfidence, 0) / withConf.length)
     : 0;
 
-  const upPredictions = decided.filter((w) => w.prediction === "UP").length;
-  const downPredictions = decided.filter((w) => w.prediction === "DOWN").length;
-  const upCorrect = decided.filter((w) => w.prediction === "UP" && w.predictionCorrect).length;
-  const downCorrect = decided.filter((w) => w.prediction === "DOWN" && w.predictionCorrect).length;
+  const upPredictions = windows.filter((w) => w.prediction === "UP").length;
+  const downPredictions = windows.filter((w) => w.prediction === "DOWN").length;
+  const upCorrect = windows.filter((w) => w.prediction === "UP" && w.predictionCorrect === true).length;
+  const downCorrect = windows.filter((w) => w.prediction === "DOWN" && w.predictionCorrect === true).length;
 
   return {
-    totalPredictions: decided.length,
-    correctPredictions: correct.length,
+    totalPredictions,
+    correctPredictions,
     accuracy,
     currentStreak,
     currentStreakType,
@@ -410,86 +426,145 @@ function computeSessionStats(pastWindows: FiveMinWindow[]): SessionStats {
   };
 }
 
-// ---- Main hook ----
+// Convert DB window to FiveMinWindow
+function dbWindowToFiveMin(dbWin: {
+  windowStart: number;
+  windowEnd: number;
+  prediction?: string | null;
+  predictionConfidence?: number | null;
+  predictionMadeAt?: number | null;
+  actualResult?: string | null;
+  predictionCorrect?: boolean | null;
+  openPrice?: number | null;
+  closePrice?: number | null;
+  priceChangePct?: number | null;
+  highPrice?: number | null;
+  lowPrice?: number | null;
+  totalVolume?: number | null;
+  analysisFactors?: unknown;
+  id?: number;
+  source?: string | null;
+}): FiveMinWindow {
+  const factors = (dbWin.analysisFactors as AdvancedFactors | null) ?? {
+    momentum: 0, volumeDelta: 0, priceVelocity: 0, rsiScore: 50,
+    emaSignal: 0, bollingerPos: 50, vwapDeviation: 0,
+    bodyRatio: 50, wickBias: 0, trendStrength: 50,
+    rawScore: 0, signalStrength: "WEAK" as const,
+  };
+
+  return {
+    windowStart: dbWin.windowStart,
+    windowEnd: dbWin.windowEnd,
+    candles: [],
+    prediction: (dbWin.prediction as "UP" | "DOWN" | "NEUTRAL" | null) ?? null,
+    predictionConfidence: dbWin.predictionConfidence ?? 0,
+    predictionMadeAt: dbWin.predictionMadeAt ?? null,
+    actualResult: (dbWin.actualResult as "UP" | "DOWN" | null) ?? null,
+    predictionCorrect: dbWin.predictionCorrect ?? null,
+    analysisFactors: factors,
+    openPrice: dbWin.openPrice ?? 0,
+    closePrice: dbWin.closePrice ?? null,
+    priceChangePct: dbWin.priceChangePct ?? null,
+    highPrice: dbWin.highPrice ?? 0,
+    lowPrice: dbWin.lowPrice ?? 0,
+    totalVolume: dbWin.totalVolume ?? 0,
+    streakType: "NONE",
+    dbId: dbWin.id,
+    source: dbWin.source ?? "browser",
+  };
+}
+
 export function useBitcoinData(): UseBitcoinDataResult {
   const [candles, setCandles] = useState<Candle[]>([]);
   const [currentWindow, setCurrentWindow] = useState<FiveMinWindow | null>(null);
   const [pastWindows, setPastWindows] = useState<FiveMinWindow[]>([]);
   const [now, setNow] = useState(Date.now());
   const [initialized, setInitialized] = useState(false);
+  const [dbHistoryTotal, setDbHistoryTotal] = useState(0);
 
-  const candlesRef = useRef<Candle[]>([]);
   const currentWindowRef = useRef<FiveMinWindow | null>(null);
-  const pastWindowsRef = useRef<FiveMinWindow[]>([]);
-
-  useEffect(() => { candlesRef.current = candles; }, [candles]);
-  useEffect(() => { currentWindowRef.current = currentWindow; }, [currentWindow]);
-  useEffect(() => { pastWindowsRef.current = pastWindows; }, [pastWindows]);
+  const candlesRef = useRef<Candle[]>([]);
+  const savedWindowsRef = useRef<Set<number>>(new Set());
+  const finalizedWindowsRef = useRef<Set<number>>(new Set());
 
   // tRPC queries
-  const klinesQuery = trpc.btc.klines.useQuery(
-    { limit: 30 },
-    { refetchOnWindowFocus: false, retry: 3 }
-  );
+  const klinesQuery = trpc.btc.klines.useQuery({ limit: 60 }, {
+    refetchInterval: 60000,
+    staleTime: 30000,
+  });
 
   const tickerQuery = trpc.btc.ticker.useQuery(undefined, {
-    refetchInterval: 5000,
-    refetchOnWindowFocus: false,
-    retry: 3,
+    refetchInterval: 10000,
+    staleTime: 5000,
   });
 
   const recentQuery = trpc.btc.recent.useQuery(undefined, {
     refetchInterval: 10000,
-    refetchOnWindowFocus: false,
-    retry: 3,
+    staleTime: 5000,
     enabled: initialized,
   });
 
-  // Process initial candles
+  // Load history from DB
+  const historyQuery = trpc.history.list.useQuery(
+    { limit: 100, offset: 0 },
+    { staleTime: 30000, refetchInterval: 60000 }
+  );
+
+  // tRPC mutations for persistence
+  const saveWindowMutation = trpc.history.save.useMutation();
+  const finalizeWindowMutation = trpc.history.finalize.useMutation();
+
+  // Update candles ref
+  useEffect(() => {
+    candlesRef.current = candles;
+  }, [candles]);
+
+  // Load DB history into pastWindows
+  useEffect(() => {
+    if (!historyQuery.data) return;
+    const { windows, total } = historyQuery.data;
+    setDbHistoryTotal(total);
+
+    if (windows.length > 0) {
+      const dbWindows = windows.map(dbWindowToFiveMin);
+      setPastWindows((prev) => {
+        // Merge: DB windows + in-memory windows, deduplicate by windowStart
+        const merged = new Map<number, FiveMinWindow>();
+        dbWindows.forEach((w) => merged.set(w.windowStart, w));
+        // In-memory takes priority for current session
+        prev.forEach((w) => {
+          if (w.actualResult !== null || !merged.has(w.windowStart)) {
+            merged.set(w.windowStart, w);
+          }
+        });
+        return Array.from(merged.values())
+          .sort((a, b) => b.windowStart - a.windowStart)
+          .slice(0, 100);
+      });
+    }
+  }, [historyQuery.data]);
+
+  // Initialize from klines
   useEffect(() => {
     if (!klinesQuery.data || initialized) return;
 
-    const parsed = klinesQuery.data.map(parseRawCandle);
+    const rawCandles = klinesQuery.data as [number, string, string, string, string, string, ...unknown[]][];
+    const parsed = rawCandles.map(parseRawCandle);
     setCandles(parsed);
     candlesRef.current = parsed;
 
     const nowTs = Date.now();
     const currentWS = getWindowStart(nowTs);
-    const windowMap = new Map<number, Candle[]>();
+    const currentCandles = parsed.filter(
+      (c) => c.time >= currentWS && c.time < currentWS + 5 * 60 * 1000
+    );
 
-    parsed.forEach((c) => {
-      const ws = getWindowStart(c.time);
-      if (!windowMap.has(ws)) windowMap.set(ws, []);
-      windowMap.get(ws)!.push(c);
-    });
-
-    const pastWs: FiveMinWindow[] = [];
-    windowMap.forEach((wCandles, ws) => {
-      if (ws === currentWS) return;
-      const sorted = wCandles.sort((a, b) => a.time - b.time);
-      pastWs.push(buildWindowFromCandles(ws, sorted, true));
-    });
-
-    const sortedPast = pastWs.sort((a, b) => b.windowStart - a.windowStart).slice(0, 20);
-
-    // Annotate streak types
-    for (let i = 0; i < sortedPast.length; i++) {
-      const w = sortedPast[i];
-      if (w.predictionCorrect === true) sortedPast[i] = { ...w, streakType: "WIN" };
-      else if (w.predictionCorrect === false) sortedPast[i] = { ...w, streakType: "LOSS" };
-    }
-
-    setPastWindows(sortedPast);
-    pastWindowsRef.current = sortedPast;
-
-    // Build current window
-    const currentCandles = (windowMap.get(currentWS) || []).sort((a, b) => a.time - b.time);
     const elapsed = nowTs - currentWS;
-    const analysisCandles = currentCandles.slice(0, 3);
-    const hasPrediction = elapsed >= 3 * 60 * 1000 || analysisCandles.length >= 3;
+    const shouldPredict = elapsed >= 3 * 60 * 1000 || currentCandles.length >= 3;
 
     let cw: FiveMinWindow;
-    if (hasPrediction && analysisCandles.length > 0) {
+    if (shouldPredict && currentCandles.length >= 2) {
+      const analysisCandles = currentCandles.slice(0, 3);
       const { prediction, confidence, factors } = computePrediction(analysisCandles);
       const openPrice = currentCandles[0]?.open ?? 0;
       cw = {
@@ -541,6 +616,27 @@ export function useBitcoinData(): UseBitcoinDataResult {
     setInitialized(true);
   }, [klinesQuery.data, initialized]);
 
+  // Save window to DB when prediction is made
+  useEffect(() => {
+    const cw = currentWindow;
+    if (!cw || !cw.prediction || savedWindowsRef.current.has(cw.windowStart)) return;
+
+    savedWindowsRef.current.add(cw.windowStart);
+    saveWindowMutation.mutate({
+      windowStart: cw.windowStart,
+      windowEnd: cw.windowEnd,
+      prediction: cw.prediction,
+      predictionConfidence: cw.predictionConfidence,
+      predictionMadeAt: cw.predictionMadeAt,
+      openPrice: cw.openPrice,
+      highPrice: cw.highPrice,
+      lowPrice: cw.lowPrice,
+      totalVolume: cw.totalVolume,
+      analysisFactors: cw.analysisFactors as unknown as Record<string, unknown>,
+      source: "browser",
+    });
+  }, [currentWindow?.prediction, currentWindow?.windowStart]);
+
   // Process recent candle updates
   const processRecentCandles = useCallback((newRaw: [number, string, string, string, string, string, ...unknown[]][]) => {
     const newCandles = newRaw.map(parseRawCandle);
@@ -567,8 +663,26 @@ export function useBitcoinData(): UseBitcoinDataResult {
       if (prevCandles.length > 0) {
         const sorted = prevCandles.sort((a, b) => a.time - b.time);
         const finalizedWindow = buildWindowFromCandles(cw.windowStart, sorted, true);
+
+        // Persist finalization to DB
+        if (!finalizedWindowsRef.current.has(cw.windowStart)) {
+          finalizedWindowsRef.current.add(cw.windowStart);
+          if (finalizedWindow.closePrice !== null && finalizedWindow.actualResult !== null) {
+            finalizeWindowMutation.mutate({
+              windowStart: cw.windowStart,
+              closePrice: finalizedWindow.closePrice,
+              actualResult: finalizedWindow.actualResult,
+              predictionCorrect: finalizedWindow.predictionCorrect,
+              priceChangePct: finalizedWindow.priceChangePct ?? 0,
+              highPrice: finalizedWindow.highPrice,
+              lowPrice: finalizedWindow.lowPrice,
+              totalVolume: finalizedWindow.totalVolume,
+            });
+          }
+        }
+
         setPastWindows((prev) => {
-          const updated = [finalizedWindow, ...prev].slice(0, 20);
+          const updated = [finalizedWindow, ...prev.filter((w) => w.windowStart !== cw.windowStart)].slice(0, 100);
           return updated;
         });
       }
@@ -705,5 +819,6 @@ export function useBitcoinData(): UseBitcoinDataResult {
     isInAnalysisPhase,
     accuracy,
     sessionStats,
+    dbHistoryTotal,
   };
 }

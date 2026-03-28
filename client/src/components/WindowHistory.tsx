@@ -6,12 +6,13 @@
 import { FiveMinWindow } from "@/hooks/useBitcoinData";
 import {
   CheckCircle, XCircle, Minus, TrendingUp, TrendingDown,
-  ChevronDown, ChevronUp, BarChart2, Zap
+  ChevronDown, ChevronUp, BarChart2, Zap, Database
 } from "lucide-react";
 import { useState } from "react";
 
 interface WindowHistoryProps {
   pastWindows: FiveMinWindow[];
+  dbHistoryTotal?: number;
 }
 
 function MiniConfBar({ value, max = 100 }: { value: number; max?: number }) {
@@ -51,7 +52,7 @@ function FactorMini({ label, value, range = 100 }: { label: string; value: numbe
   );
 }
 
-export default function WindowHistory({ pastWindows }: WindowHistoryProps) {
+export default function WindowHistory({ pastWindows, dbHistoryTotal = 0 }: WindowHistoryProps) {
   const [expandedRow, setExpandedRow] = useState<number | null>(null);
   const [showAll, setShowAll] = useState(false);
 
@@ -63,14 +64,14 @@ export default function WindowHistory({ pastWindows }: WindowHistoryProps) {
             No completed windows yet
           </div>
           <div className="text-xs mt-1" style={{ color: "#445566" }}>
-            History will appear after the first 5-minute window closes
+            History will appear after the first 5-minute window closes. Background scheduler stores predictions even when this page is closed.
           </div>
         </div>
       </div>
     );
   }
 
-  const displayWindows = showAll ? pastWindows : pastWindows.slice(0, 10);
+  const displayWindows = showAll ? pastWindows : pastWindows.slice(0, 15);
 
   return (
     <div className="glass-panel overflow-hidden">
@@ -91,6 +92,12 @@ export default function WindowHistory({ pastWindows }: WindowHistoryProps) {
             {pastWindows.length}
           </span>
         </div>
+        {dbHistoryTotal > 0 && (
+          <div className="flex items-center gap-1 text-xs" style={{ color: "#334455" }}>
+            <Database size={10} style={{ color: "#a78bfa" }} />
+            <span>{dbHistoryTotal} in DB</span>
+          </div>
+        )}
         <div className="hidden sm:flex items-center gap-4 text-xs font-mono-data" style={{ color: "#334455" }}>
           <span>Time</span>
           <span className="w-16 text-center">Prediction</span>
@@ -318,14 +325,14 @@ export default function WindowHistory({ pastWindows }: WindowHistoryProps) {
       </div>
 
       {/* Show more / less */}
-      {pastWindows.length > 10 && (
+      {pastWindows.length > 15 && (
         <div
           className="px-4 py-2.5 text-center border-t cursor-pointer hover:bg-white/[0.02] transition-colors"
           style={{ borderColor: "rgba(255,255,255,0.06)" }}
           onClick={() => setShowAll(!showAll)}
         >
           <span className="text-xs font-mono-data" style={{ color: "#445566" }}>
-            {showAll ? "Show less" : `Show all ${pastWindows.length} windows`}
+            {showAll ? "Show less" : `Show all ${pastWindows.length} windows${dbHistoryTotal > pastWindows.length ? ` (${dbHistoryTotal} in DB)` : ""}`}
           </span>
         </div>
       )}

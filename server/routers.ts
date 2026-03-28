@@ -3,14 +3,35 @@ import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, router } from "./_core/trpc";
 import { z } from "zod";
+import { getDb } from "./db";
+import {
+  predictionWindows,
+  patternSettings,
+  mlModelState,
+  schedulerConfig,
+  predictionRevisions,
+} from "../drizzle/schema";
+import { eq, desc, and, isNotNull, gte, sql } from "drizzle-orm";
+import {
+  runMLTraining,
+  runBackgroundPrediction,
+  DEFAULT_PATTERNS,
+  computePredictionWithWeights,
+  getMLWeights,
+  getEnabledPatterns,
+} from "./predictionEngine";
 
-// ---- Lightweight OpenAI-compatible LLM call (works on Railway with OPENAI_API_KEY) ----
+// ---- Lightweight OpenAI-compatible LLM call ----
 async function callLLM(prompt: string): Promise<string> {
-  const apiKey = process.env.OPENAI_API_KEY;
-  const baseUrl = (process.env.OPENAI_BASE_URL || process.env.BUILT_IN_FORGE_API_URL || "https://api.openai.com/v1").replace(/\/$/, "");
+  const apiKey = process.env.OPENAI_API_KEY || process.env.BUILT_IN_FORGE_API_KEY;
+  const baseUrl = (
+    process.env.OPENAI_BASE_URL ||
+    process.env.BUILT_IN_FORGE_API_URL ||
+    "https://api.openai.com/v1"
+  ).replace(/\/$/, "");
   const model = process.env.LLM_MODEL || "gpt-4.1-mini";
 
-  if (!apiKey) throw new Error("OPENAI_API_KEY is not set");
+  if (!apiKey) throw new Error("No API key available for LLM");
 
   const res = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
@@ -33,10 +54,10 @@ async function callLLM(prompt: string): Promise<string> {
   return json.choices[0]?.message?.content ?? "{}";
 }
 
-// Kraken free public API — globally accessible, no auth, no rate-limiting
+// Kraken free public API
 const KRAKEN_BASE = "https://api.kraken.com/0/public";
 
-// Simple in-memory cache to avoid unnecessary API calls
+// Simple in-memory cache
 const cache: Record<string, { data: unknown; expiry: number }> = {};
 
 function getCached(key: string): unknown | null {
@@ -56,24 +77,16 @@ function setCached(key: string, data: unknown, ttlSeconds = 10): void {
 async function fetchKraken(path: string): Promise<unknown> {
   const cacheKey = `kraken:${path}`;
   const cached = getCached(cacheKey);
-  if (cached) {
-    console.log(`[Cache HIT] ${cacheKey}`);
-    return cached;
-  }
+  if (cached) return cached;
 
   const res = await fetch(`${KRAKEN_BASE}${path}`, {
     headers: { "Accept": "application/json" },
   });
-  if (!res.ok) {
-    throw new Error(`Kraken API error: ${res.status}`);
-  }
+  if (!res.ok) throw new Error(`Kraken API error: ${res.status}`);
   const json = await res.json();
-  
-  if (json.error && json.error.length > 0) {
-    throw new Error(`Kraken API error: ${json.error[0]}`);
-  }
+  if (json.error && json.error.length > 0) throw new Error(`Kraken API error: ${json.error[0]}`);
 
-  setCached(cacheKey, json.result, 10); // Cache for 10 seconds
+  setCached(cacheKey, json.result, 10);
   return json.result;
 }
 
@@ -114,35 +127,24 @@ export const appRouter = router({
     }),
   }),
 
-  // Bitcoin data proxy — routes Kraken API calls through the server with caching
+  // Bitcoin data proxy
   btc: router({
-    /**
-     * Get 1-minute OHLCV candles for BTC/USD from Kraken
-     * Used for chart display and prediction algorithm
-     */
     klines: publicProcedure
       .input(z.object({ limit: z.number().min(1).max(500).default(30) }))
       .query(async ({ input }) => {
         try {
-          // Kraken returns: [time, open, high, low, close, vwap, volume, count]
           const result = await fetchKraken("/OHLC?pair=XBTUSD&interval=1") as Record<string, unknown[]>;
           const data = result.XXBTZUSD as [number, string, string, string, string, string, string, number][];
-          
-          if (!data || data.length === 0) {
-            throw new Error("No OHLC data returned from Kraken");
-          }
-
-          // Take the most recent candles
+          if (!data || data.length === 0) throw new Error("No OHLC data returned from Kraken");
           const recent = data.slice(-input.limit).map((candle) => [
-            candle[0] * 1000, // Convert seconds to milliseconds
-            candle[1], // open
-            candle[2], // high
-            candle[3], // low
-            candle[4], // close
-            candle[6], // volume
+            candle[0] * 1000,
+            candle[1],
+            candle[2],
+            candle[3],
+            candle[4],
+            candle[6],
             "0",
           ]) as [number, string, string, string, string, string, string][];
-
           return recent;
         } catch (error) {
           console.error("[Kraken klines error]", error);
@@ -150,15 +152,10 @@ export const appRouter = router({
         }
       }),
 
-    /**
-     * Get 24-hour ticker statistics for BTC/USD
-     * Used for the live price header
-     */
     ticker: publicProcedure.query(async () => {
       try {
         const result = await fetchKraken("/Ticker?pair=XBTUSD") as Record<string, Record<string, unknown[]>>;
         const ticker = result.XXBTZUSD as Record<string, unknown[]>;
-
         const lastPrice = parseFloat((ticker.c as string[])[0]);
         const high24h = parseFloat((ticker.h as string[])[1]);
         const low24h = parseFloat((ticker.l as string[])[1]);
@@ -166,7 +163,6 @@ export const appRouter = router({
         const open24h = parseFloat((ticker.o as string[])[1]);
         const change24h = lastPrice - open24h;
         const changePct24h = open24h > 0 ? (change24h / open24h) * 100 : 0;
-
         return {
           price: lastPrice,
           priceChange24h: change24h,
@@ -182,20 +178,11 @@ export const appRouter = router({
       }
     }),
 
-    /**
-     * Get recent candles for polling
-     * Used for live updates every 10 seconds
-     */
     recent: publicProcedure.query(async () => {
       try {
         const result = await fetchKraken("/OHLC?pair=XBTUSD&interval=1") as Record<string, unknown[]>;
         const data = result.XXBTZUSD as [number, string, string, string, string, string, string, number][];
-
-        if (!data || data.length === 0) {
-          throw new Error("No recent candles returned from Kraken");
-        }
-
-        // Return last 6 candles
+        if (!data || data.length === 0) throw new Error("No recent candles returned from Kraken");
         const recent = data.slice(-6).map((candle) => [
           candle[0] * 1000,
           candle[1],
@@ -205,7 +192,6 @@ export const appRouter = router({
           candle[6],
           "0",
         ]) as [number, string, string, string, string, string, string][];
-
         return recent;
       } catch (error) {
         console.error("[Kraken recent error]", error);
@@ -213,11 +199,6 @@ export const appRouter = router({
       }
     }),
 
-    /**
-     * AI-powered prediction using Gemini 2.5 Flash
-     * Analyzes candle data + technical factors and returns structured prediction
-     * Cached for 60 seconds to avoid excessive LLM calls
-     */
     aiPredict: publicProcedure
       .input(z.object({
         candles: z.array(CandleSchema),
@@ -228,18 +209,12 @@ export const appRouter = router({
         windowStart: z.number(),
       }))
       .mutation(async ({ input }) => {
-        // Cache key based on window start to avoid repeated calls for same window
         const cacheKey = `ai_predict:${input.windowStart}`;
         const cached = getCached(cacheKey);
-        if (cached) {
-          console.log(`[Cache HIT] ${cacheKey}`);
-          return cached as AIPredictionResult;
-        }
+        if (cached) return cached as AIPredictionResult;
 
         try {
           const { candles, factors, mathPrediction, mathConfidence, sessionAccuracy } = input;
-
-          // Build a concise market summary for the AI
           const candleSummary = candles.map((c, i) => {
             const dir = c.isBullish ? "▲" : "▼";
             const body = Math.abs(c.close - c.open);
@@ -284,12 +259,10 @@ Respond in JSON only. Be decisive but honest about uncertainty. SKIP means the r
 
           const text = await callLLM(prompt);
           const parsed = JSON.parse(text) as AIPredictionResult;
-
-          setCached(cacheKey, parsed, 60); // Cache for 60 seconds (one window)
+          setCached(cacheKey, parsed, 60);
           return parsed;
         } catch (error) {
           console.error("[AI Predict error]", error);
-          // Return a fallback response instead of throwing
           const fallback: AIPredictionResult = {
             prediction: "SKIP",
             confidence: 0,
@@ -301,9 +274,527 @@ Respond in JSON only. Be decisive but honest about uncertainty. SKIP means the r
           return fallback;
         }
       }),
+
+    // Mid-window prediction revision with cashout guidance
+    midWindowRevision: publicProcedure
+      .input(z.object({
+        candles: z.array(CandleSchema),
+        factors: FactorsSchema,
+        originalPrediction: z.enum(["UP", "DOWN", "NEUTRAL"]),
+        originalConfidence: z.number(),
+        currentPrice: z.number(),
+        openPrice: z.number(),
+        minuteIntoWindow: z.number(),
+        windowStart: z.number(),
+      }))
+      .mutation(async ({ input }) => {
+        const cacheKey = `mid_revision:${input.windowStart}:${Math.floor(input.minuteIntoWindow)}`;
+        const cached = getCached(cacheKey);
+        if (cached) return cached as MidWindowRevision;
+
+        try {
+          const { candles, factors, originalPrediction, originalConfidence, currentPrice, openPrice, minuteIntoWindow } = input;
+          const priceChangePct = openPrice > 0 ? ((currentPrice - openPrice) / openPrice) * 100 : 0;
+
+          // Get ML weights for server-side re-prediction
+          const mlWeights = await getMLWeights();
+          const enabledPatterns = await getEnabledPatterns();
+          const activeWeights = { ...mlWeights };
+          Object.keys(activeWeights).forEach((key) => {
+            if (!enabledPatterns.has(key)) activeWeights[key] = 0;
+          });
+
+          const serverCandles = candles.map(c => ({ ...c }));
+          const { prediction: newPrediction, confidence: newConfidence } = computePredictionWithWeights(serverCandles, activeWeights);
+
+          // Determine if revision is significant
+          const confidenceChange = Math.abs(newConfidence - originalConfidence);
+          const predictionChanged = newPrediction !== originalPrediction && newPrediction !== "NEUTRAL";
+          const shouldRevise = confidenceChange > 10 || predictionChanged;
+
+          // Cashout guidance
+          let cashoutGuidance: CashoutGuidance | null = null;
+          if (minuteIntoWindow > 2) {
+            cashoutGuidance = computeCashoutGuidance(
+              originalPrediction,
+              newPrediction,
+              originalConfidence,
+              newConfidence,
+              priceChangePct,
+              minuteIntoWindow
+            );
+          }
+
+          const result: MidWindowRevision = {
+            shouldRevise,
+            newPrediction: shouldRevise ? newPrediction : originalPrediction,
+            newConfidence: shouldRevise ? newConfidence : originalConfidence,
+            predictionChanged,
+            confidenceChange,
+            priceChangePct,
+            cashoutGuidance,
+            revisedAt: Date.now(),
+          };
+
+          setCached(cacheKey, result, 30);
+
+          // Store revision in DB if significant
+          if (shouldRevise) {
+            const db = await getDb();
+            if (db) {
+              const [existingWindow] = await db
+                .select()
+                .from(predictionWindows)
+                .where(eq(predictionWindows.windowStart, input.windowStart))
+                .limit(1);
+
+              if (existingWindow) {
+                const revisionCount = await db
+                  .select({ count: sql<number>`count(*)` })
+                  .from(predictionRevisions)
+                  .where(eq(predictionRevisions.windowId, existingWindow.id));
+
+                await db.insert(predictionRevisions).values({
+                  windowId: existingWindow.id,
+                  windowStart: input.windowStart,
+                  revisionNumber: (revisionCount[0]?.count ?? 0) + 1,
+                  previousPrediction: originalPrediction,
+                  newPrediction: newPrediction as "UP" | "DOWN" | "NEUTRAL",
+                  previousConfidence: originalConfidence,
+                  newConfidence,
+                  reason: predictionChanged
+                    ? `Prediction flipped from ${originalPrediction} to ${newPrediction} at ${minuteIntoWindow.toFixed(1)} min`
+                    : `Confidence changed by ${confidenceChange.toFixed(1)}%`,
+                  minuteIntoWindow,
+                  analysisFactors: factors as unknown as Record<string, unknown>,
+                });
+              }
+            }
+          }
+
+          return result;
+        } catch (error) {
+          console.error("[Mid-window revision error]", error);
+          return {
+            shouldRevise: false,
+            newPrediction: input.originalPrediction,
+            newConfidence: input.originalConfidence,
+            predictionChanged: false,
+            confidenceChange: 0,
+            priceChangePct: 0,
+            cashoutGuidance: null,
+            revisedAt: Date.now(),
+          } as MidWindowRevision;
+        }
+      }),
+  }),
+
+  // Prediction history from DB
+  history: router({
+    list: publicProcedure
+      .input(z.object({
+        limit: z.number().min(1).max(200).default(50),
+        offset: z.number().min(0).default(0),
+      }))
+      .query(async ({ input }) => {
+        try {
+          const db = await getDb();
+          if (!db) return { windows: [], total: 0 };
+
+          const windows = await db
+            .select()
+            .from(predictionWindows)
+            .orderBy(desc(predictionWindows.windowStart))
+            .limit(input.limit)
+            .offset(input.offset);
+
+          const [{ count }] = await db
+            .select({ count: sql<number>`count(*)` })
+            .from(predictionWindows);
+
+          return { windows, total: count };
+        } catch (error) {
+          console.error("[History list error]", error);
+          return { windows: [], total: 0 };
+        }
+      }),
+
+    // Save a prediction window from the browser
+    save: publicProcedure
+      .input(z.object({
+        windowStart: z.number(),
+        windowEnd: z.number(),
+        prediction: z.enum(["UP", "DOWN", "NEUTRAL"]).nullable(),
+        predictionConfidence: z.number(),
+        predictionMadeAt: z.number().nullable(),
+        openPrice: z.number(),
+        highPrice: z.number(),
+        lowPrice: z.number(),
+        totalVolume: z.number(),
+        analysisFactors: z.record(z.string(), z.unknown()).nullable(),
+        source: z.string().default("browser"),
+      }))
+      .mutation(async ({ input }) => {
+        try {
+          const db = await getDb();
+          if (!db) return { success: false };
+
+          // Check if already exists
+          const existing = await db
+            .select()
+            .from(predictionWindows)
+            .where(eq(predictionWindows.windowStart, input.windowStart))
+            .limit(1);
+
+          if (existing.length > 0) {
+            // Update if new prediction is available
+            if (input.prediction && !existing[0].prediction) {
+              await db
+                .update(predictionWindows)
+                .set({
+                  prediction: input.prediction,
+                  predictionConfidence: input.predictionConfidence,
+                  predictionMadeAt: input.predictionMadeAt,
+                  analysisFactors: input.analysisFactors as Record<string, unknown>,
+                  source: input.source,
+                })
+                .where(eq(predictionWindows.id, existing[0].id));
+            }
+            return { success: true, id: existing[0].id };
+          }
+
+          const [result] = await db.insert(predictionWindows).values({
+            windowStart: input.windowStart,
+            windowEnd: input.windowEnd,
+            prediction: input.prediction ?? undefined,
+            predictionConfidence: input.predictionConfidence,
+            predictionMadeAt: input.predictionMadeAt ?? undefined,
+            openPrice: input.openPrice,
+            highPrice: input.highPrice,
+            lowPrice: input.lowPrice,
+            totalVolume: input.totalVolume,
+            analysisFactors: input.analysisFactors as Record<string, unknown>,
+            source: input.source,
+          });
+
+          return { success: true, id: (result as { insertId: number }).insertId };
+        } catch (error) {
+          console.error("[History save error]", error);
+          return { success: false };
+        }
+      }),
+
+    // Finalize a window with actual outcome
+    finalize: publicProcedure
+      .input(z.object({
+        windowStart: z.number(),
+        closePrice: z.number(),
+        actualResult: z.enum(["UP", "DOWN"]),
+        predictionCorrect: z.boolean().nullable(),
+        priceChangePct: z.number(),
+        highPrice: z.number(),
+        lowPrice: z.number(),
+        totalVolume: z.number(),
+      }))
+      .mutation(async ({ input }) => {
+        try {
+          const db = await getDb();
+          if (!db) return { success: false };
+
+          await db
+            .update(predictionWindows)
+            .set({
+              closePrice: input.closePrice,
+              actualResult: input.actualResult,
+              predictionCorrect: input.predictionCorrect ?? undefined,
+              priceChangePct: input.priceChangePct,
+              highPrice: input.highPrice,
+              lowPrice: input.lowPrice,
+              totalVolume: input.totalVolume,
+            })
+            .where(eq(predictionWindows.windowStart, input.windowStart));
+
+          return { success: true };
+        } catch (error) {
+          console.error("[History finalize error]", error);
+          return { success: false };
+        }
+      }),
+
+    // Get stats summary
+    stats: publicProcedure.query(async () => {
+      try {
+        const db = await getDb();
+        if (!db) return null;
+
+        const [total] = await db
+          .select({ count: sql<number>`count(*)` })
+          .from(predictionWindows)
+          .where(isNotNull(predictionWindows.prediction));
+
+        const [correct] = await db
+          .select({ count: sql<number>`count(*)` })
+          .from(predictionWindows)
+          .where(eq(predictionWindows.predictionCorrect, true));
+
+        const [schedulerRun] = await db.select().from(schedulerConfig).limit(1);
+
+        return {
+          totalPredictions: total.count,
+          correctPredictions: correct.count,
+          accuracy: total.count > 0 ? (correct.count / total.count) * 100 : 0,
+          schedulerEnabled: schedulerRun?.enabled ?? false,
+          schedulerLastRun: schedulerRun?.lastRunAt?.toISOString() ?? null,
+          schedulerTotalRuns: schedulerRun?.totalRuns ?? 0,
+        };
+      } catch (error) {
+        console.error("[History stats error]", error);
+        return null;
+      }
+    }),
+  }),
+
+  // Pattern settings management
+  patterns: router({
+    list: publicProcedure.query(async () => {
+      try {
+        const db = await getDb();
+        if (!db) {
+          // Return defaults if no DB
+          return DEFAULT_PATTERNS.map((p) => ({
+            id: 0,
+            patternKey: p.patternKey,
+            patternName: p.patternName,
+            description: p.description ?? "",
+            enabled: true,
+            weight: p.weight,
+            totalPredictions: 0,
+            correctPredictions: 0,
+            successRate: 0,
+            mlWeight: p.weight,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          }));
+        }
+
+        const patterns = await db.select().from(patternSettings).orderBy(desc(patternSettings.successRate));
+
+        // If no patterns in DB, return defaults
+        if (patterns.length === 0) {
+          return DEFAULT_PATTERNS.map((p) => ({
+            id: 0,
+            patternKey: p.patternKey,
+            patternName: p.patternName,
+            description: p.description ?? "",
+            enabled: true,
+            weight: p.weight,
+            totalPredictions: 0,
+            correctPredictions: 0,
+            successRate: 0,
+            mlWeight: p.weight,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          }));
+        }
+
+        return patterns;
+      } catch (error) {
+        console.error("[Patterns list error]", error);
+        return DEFAULT_PATTERNS.map((p) => ({
+          id: 0,
+          patternKey: p.patternKey,
+          patternName: p.patternName,
+          description: p.description ?? "",
+          enabled: true,
+          weight: p.weight,
+          totalPredictions: 0,
+          correctPredictions: 0,
+          successRate: 0,
+          mlWeight: p.weight,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }));
+      }
+    }),
+
+    toggle: publicProcedure
+      .input(z.object({
+        patternKey: z.string(),
+        enabled: z.boolean(),
+      }))
+      .mutation(async ({ input }) => {
+        try {
+          const db = await getDb();
+          if (!db) return { success: false };
+
+          await db
+            .update(patternSettings)
+            .set({ enabled: input.enabled })
+            .where(eq(patternSettings.patternKey, input.patternKey));
+
+          return { success: true };
+        } catch (error) {
+          console.error("[Pattern toggle error]", error);
+          return { success: false };
+        }
+      }),
+
+    updateWeight: publicProcedure
+      .input(z.object({
+        patternKey: z.string(),
+        weight: z.number().min(0).max(1),
+      }))
+      .mutation(async ({ input }) => {
+        try {
+          const db = await getDb();
+          if (!db) return { success: false };
+
+          await db
+            .update(patternSettings)
+            .set({ weight: input.weight })
+            .where(eq(patternSettings.patternKey, input.patternKey));
+
+          return { success: true };
+        } catch (error) {
+          console.error("[Pattern weight error]", error);
+          return { success: false };
+        }
+      }),
+  }),
+
+  // ML model management
+  ml: router({
+    status: publicProcedure.query(async () => {
+      try {
+        const db = await getDb();
+        if (!db) {
+          return {
+            version: 1,
+            trainingRounds: 0,
+            totalSamples: 0,
+            lastTrainingAccuracy: null,
+            bestAccuracy: null,
+            status: "idle" as const,
+            lastTrainedAt: null,
+            weights: null,
+          };
+        }
+
+        const [model] = await db
+          .select()
+          .from(mlModelState)
+          .orderBy(desc(mlModelState.version))
+          .limit(1);
+
+        if (!model) {
+          return {
+            version: 1,
+            trainingRounds: 0,
+            totalSamples: 0,
+            lastTrainingAccuracy: null,
+            bestAccuracy: null,
+            status: "idle" as const,
+            lastTrainedAt: null,
+            weights: null,
+          };
+        }
+
+        return {
+          version: model.version,
+          trainingRounds: model.trainingRounds,
+          totalSamples: model.totalSamples,
+          lastTrainingAccuracy: model.lastTrainingAccuracy,
+          bestAccuracy: model.bestAccuracy,
+          status: model.status,
+          lastTrainedAt: model.lastTrainedAt?.toISOString() ?? null,
+          weights: model.weights as Record<string, number> | null,
+        };
+      } catch (error) {
+        console.error("[ML status error]", error);
+        return {
+          version: 1,
+          trainingRounds: 0,
+          totalSamples: 0,
+          lastTrainingAccuracy: null,
+          bestAccuracy: null,
+          status: "idle" as const,
+          lastTrainedAt: null,
+          weights: null,
+        };
+      }
+    }),
+
+    triggerTraining: publicProcedure.mutation(async () => {
+      try {
+        // Run training asynchronously
+        runMLTraining().catch(console.error);
+        return { success: true, message: "ML training started" };
+      } catch (error) {
+        console.error("[ML trigger error]", error);
+        return { success: false, message: "Failed to start training" };
+      }
+    }),
+  }),
+
+  // Scheduler management
+  scheduler: router({
+    status: publicProcedure.query(async () => {
+      try {
+        const db = await getDb();
+        if (!db) return { enabled: false, totalRuns: 0, lastRunAt: null, lastRunStatus: null };
+
+        const [config] = await db.select().from(schedulerConfig).limit(1);
+        if (!config) return { enabled: false, totalRuns: 0, lastRunAt: null, lastRunStatus: null };
+
+        return {
+          enabled: config.enabled,
+          totalRuns: config.totalRuns,
+          lastRunAt: config.lastRunAt?.toISOString() ?? null,
+          lastRunStatus: config.lastRunStatus,
+          consecutiveErrors: config.consecutiveErrors,
+        };
+      } catch (error) {
+        console.error("[Scheduler status error]", error);
+        return { enabled: false, totalRuns: 0, lastRunAt: null, lastRunStatus: null };
+      }
+    }),
+
+    toggle: publicProcedure
+      .input(z.object({ enabled: z.boolean() }))
+      .mutation(async ({ input }) => {
+        try {
+          const db = await getDb();
+          if (!db) return { success: false };
+
+          const existing = await db.select().from(schedulerConfig).limit(1);
+          if (existing.length === 0) {
+            await db.insert(schedulerConfig).values({ enabled: input.enabled, totalRuns: 0, consecutiveErrors: 0 });
+          } else {
+            await db
+              .update(schedulerConfig)
+              .set({ enabled: input.enabled })
+              .where(eq(schedulerConfig.id, existing[0].id));
+          }
+
+          return { success: true };
+        } catch (error) {
+          console.error("[Scheduler toggle error]", error);
+          return { success: false };
+        }
+      }),
+
+    triggerNow: publicProcedure.mutation(async () => {
+      try {
+        runBackgroundPrediction().catch(console.error);
+        return { success: true, message: "Background prediction triggered" };
+      } catch (error) {
+        return { success: false, message: "Failed to trigger prediction" };
+      }
+    }),
   }),
 });
 
+// ---- Type exports ----
 export type AIPredictionResult = {
   prediction: "UP" | "DOWN" | "SKIP";
   confidence: number;
@@ -312,5 +803,77 @@ export type AIPredictionResult = {
   supportingSignals: string[];
   riskFactors: string[];
 };
+
+export type CashoutGuidance = {
+  recommendation: "HOLD" | "CASHOUT" | "CONSIDER_CASHOUT";
+  urgency: "LOW" | "MEDIUM" | "HIGH";
+  reason: string;
+  currentPnL: number; // estimated P&L %
+  riskScore: number; // 0-100
+};
+
+export type MidWindowRevision = {
+  shouldRevise: boolean;
+  newPrediction: "UP" | "DOWN" | "NEUTRAL";
+  newConfidence: number;
+  predictionChanged: boolean;
+  confidenceChange: number;
+  priceChangePct: number;
+  cashoutGuidance: CashoutGuidance | null;
+  revisedAt: number;
+};
+
+// ---- Cashout guidance logic ----
+function computeCashoutGuidance(
+  originalPrediction: string,
+  newPrediction: string,
+  originalConfidence: number,
+  newConfidence: number,
+  priceChangePct: number,
+  minuteIntoWindow: number
+): CashoutGuidance {
+  const predictionFlipped = originalPrediction !== newPrediction && newPrediction !== "NEUTRAL";
+  const confidenceDrop = originalConfidence - newConfidence;
+  const timeLeft = 5 - minuteIntoWindow;
+
+  // Estimate current P&L (simplified: if bet UP and price went up, positive)
+  const betDirection = originalPrediction === "UP" ? 1 : -1;
+  const currentPnL = priceChangePct * betDirection;
+
+  let recommendation: "HOLD" | "CASHOUT" | "CONSIDER_CASHOUT" = "HOLD";
+  let urgency: "LOW" | "MEDIUM" | "HIGH" = "LOW";
+  let reason = "";
+  let riskScore = 0;
+
+  if (predictionFlipped) {
+    // Model now says opposite direction
+    recommendation = "CASHOUT";
+    urgency = "HIGH";
+    reason = `Model reversed: now predicting ${newPrediction} (${newConfidence.toFixed(0)}% conf). Original ${originalPrediction} bet at risk.`;
+    riskScore = 80 + (newConfidence / 100) * 20;
+  } else if (confidenceDrop > 20) {
+    recommendation = "CONSIDER_CASHOUT";
+    urgency = "MEDIUM";
+    reason = `Confidence dropped ${confidenceDrop.toFixed(0)}% — signal weakening. ${timeLeft.toFixed(1)} min remaining.`;
+    riskScore = 50 + confidenceDrop;
+  } else if (currentPnL > 0.1 && timeLeft < 1.5) {
+    recommendation = "CONSIDER_CASHOUT";
+    urgency = "MEDIUM";
+    reason = `In profit (${currentPnL.toFixed(2)}%) with ${timeLeft.toFixed(1)} min left. Consider locking in gains.`;
+    riskScore = 40;
+  } else if (currentPnL < -0.15) {
+    recommendation = "CONSIDER_CASHOUT";
+    urgency = "HIGH";
+    reason = `Price moved against prediction (${currentPnL.toFixed(2)}%). Cut losses if trend continues.`;
+    riskScore = 70;
+  } else {
+    recommendation = "HOLD";
+    urgency = "LOW";
+    reason = `Signal holding at ${newConfidence.toFixed(0)}% confidence. ${timeLeft.toFixed(1)} min remaining.`;
+    riskScore = 20;
+  }
+
+  return { recommendation, urgency, reason, currentPnL, riskScore: Math.min(100, riskScore) };
+}
 
 export type AppRouter = typeof appRouter;
