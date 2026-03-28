@@ -8,6 +8,7 @@ import { appRouter } from "../routers";
 import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
 import { startBackgroundScheduler } from "../predictionEngine";
+import { runMigrations } from "../db";
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise(resolve => {
@@ -53,8 +54,14 @@ async function startServer() {
   }
   server.listen(port, () => {
     console.log(`Server running on http://localhost:${port}/`);
-    // Start background prediction scheduler after server is up
-    startBackgroundScheduler();
+    // Run DB migrations then start background prediction scheduler
+    runMigrations()
+      .then(() => startBackgroundScheduler())
+      .catch((err) => {
+        console.error("[Startup] Migration/scheduler error:", err);
+        // Still start scheduler even if migrations fail
+        startBackgroundScheduler();
+      });
   });
 }
 
